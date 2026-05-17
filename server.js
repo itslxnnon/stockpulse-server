@@ -729,22 +729,31 @@ async function fetchNews(ticker) {
     const results = await Promise.all(batch.map(async item => {
       const titleEn = item.translatedTitle || item.title;
       let summary = '';
-      // 1. Try scraping the real article for full text
+
+      // 1. Scrape the article for real body text to give Claude context
       const bodyText = await scrapeArticle(item.url);
+      let scrapedContext = '';
       if (bodyText) {
         const extracted = extractiveSummarise(bodyText, titleEn, ticker);
-        if (extracted && extracted.length > 60) summary = extracted;
+        if (extracted && extracted.length > 60) scrapedContext = extracted;
       }
-      // 2. Try RSS description if scrape yielded nothing useful
-      if (!summary && item._rssSum && item._rssSum.length > 60) {
-        summary = item._rssSum;
-      }
-      // 3. Call Claude Haiku to generate a summary from the headline
-      //    (requires ANTHROPIC_API_KEY env var on Render — costs ~$0.001 per search)
-      if (!summary) {
-        summary = await callClaudeForSummary(titleEn, item._rssSum || '', ticker);
-      }
-      // 4. Log result so Render logs show what happened
+
+      // 2. Check if RSS description is genuinely different from the title
+      const rssRaw = item._rssSum || '';
+      const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const rssIsRepeat = rssRaw.length < 60 || norm(rssRaw).startsWith(norm(titleEn).slice(0, 50));
+      const rssContext = rssIsRepeat ? '' : rssRaw;
+
+      // 3. Claude is the primary summarizer — always called for every article
+      //    Pass scraped content or RSS as context so Claude has real facts to work with
+      const context = scrapedContext || rssContext;
+      summary = await callClaudeForSummary(titleEn, context, ticker);
+
+      // 4. Last resort fallback if Claude fails (network issue etc)
+      if (!summary && rssContext) summary = rssContext;
+      if (!summary && scrapedContext) summary = scrapedContext;
+
+      // 5. Log per-article result in Render logs
       console.log('[SUMMARY]', item.source, '|', summary ? 'OK '+summary.length+'ch' : 'EMPTY', '|', titleEn.slice(0,50));
       const { _rssSum, ...clean } = item;
       return { ...clean, summary };
