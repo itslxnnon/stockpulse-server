@@ -21,65 +21,71 @@ async function scrapeArticle(articleUrl) {
     if (blocked.some(b => host.includes(b))) return '';
   } catch(e) { return ''; }
   try {
-    const html = await fetchURL(articleUrl, 8000);
+    const html = await fetchURL(articleUrl, 10000);
     return extractBodyText(html);
   } catch(e) { return ''; }
 }
 
 function extractBodyText(html) {
   if (!html) return '';
+  // Remove non-content blocks
   let t = html
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<(nav|header|footer|aside|form|figure|figcaption|noscript)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<!(--[\s\S]*?--|\[CDATA\[[\s\S]*?\]\])>/g, ' ')
     .replace(/<[^>]+>/g, ' ')
     .replace(/&[a-z#0-9]+;/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  const sentences = t.split(/(?<=[.!?])\s+(?=[A-Z"(])/).filter(s => {
-    s = s.trim();
-    return s.length > 45 && s.length < 600
+  // Split on sentence-ending punctuation followed by whitespace + capital
+  // Use simple split instead of lookbehind for max compatibility
+  const raw = t.replace(/([.!?])\s+([A-Z"(])/g, '$1☃$2').split('☃');
+  const sentences = raw.map(s => s.trim()).filter(s => {
+    return s.length > 50 && s.length < 700
       && /^[A-Z"(]/.test(s)
-      && !/^(Cookie|Subscribe|Sign in|Log in|Click|All rights|Privacy|Terms|Advertisement|Related|Read more|Share|Follow|Newsletter|By clicking)/i.test(s)
-      && (s.match(/\s/g)||[]).length > 5;
+      && !/^(Cookie|Subscribe|Sign in|Log in|Click here|All rights|Privacy Policy|Terms of|Advertisement|Read more|Share this|Follow us|Newsletter|By clicking|You may also|Related article|Loading)/i.test(s)
+      && (s.split(' ').length) > 7;
   });
-  return sentences.slice(0, 40).join(' ');
+  return sentences.slice(0, 50).join(' ');
 }
 
 // ── Extractive summariser ─────────────────────────────────────────────────────
 function extractiveSummarise(bodyText, title, ticker) {
-  if (!bodyText || bodyText.length < 100) return '';
+  if (!bodyText || bodyText.length < 80) return '';
   const tickerLower = ticker.toLowerCase();
-  const titleWords = title.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(w => w.length > 3);
+  const titleWords = title.toLowerCase().replace(/[^a-z0-9 ]/g,' ').split(' ').filter(w => w.length > 3);
   const FIN_WORDS = ['revenue','earnings','profit','loss','growth','sales','margin','guidance',
     'forecast','outlook','quarter','annual','results','beat','miss','upgrade','downgrade',
     'target','price','acquisition','merger','deal','partnership','dividend','buyback',
     'analyst','rating','shares','stock','market','invest','fund','capital','debt','cash',
     'percent','million','billion','increase','decrease','raised','cut','announced',
     'reported','posted','expects','projected','estimates'];
-  const sentences = bodyText.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 40);
+  // Split without lookbehind
+  const sentences = bodyText.replace(/([.!?])\s+([A-Z"(])/g,'$1☃$2').split('☃')
+    .map(s => s.trim()).filter(s => s.length > 40);
   if (!sentences.length) return '';
   const scored = sentences.map((s, i) => {
     const sl = s.toLowerCase();
     let score = 0;
-    if (i < 3) score += (3 - i) * 4;
-    if (sl.includes(tickerLower)) score += 5;
+    if (i === 0) score += 10;
+    else if (i === 1) score += 6;
+    else if (i === 2) score += 3;
+    if (sl.includes(tickerLower)) score += 6;
     for (const w of titleWords) if (sl.includes(w)) score += 2;
     for (const w of FIN_WORDS) if (sl.includes(w)) score += 1;
-    const nums = (s.match(/\d+(?:\.\d+)?[%$BMK]?/g) || []).length;
-    score += Math.min(nums, 4);
-    if (/sign up|subscribe|cookie|advertisement|click here|read more/i.test(s)) score -= 20;
+    const nums = (s.match(/\d/g) || []).length;
+    score += Math.min(nums, 5);
+    if (/sign up|subscribe|cookie|advertisement|click here|read more|follow us/i.test(s)) score -= 30;
     return { s, score, i };
   });
   const top = scored
+    .filter(x => x.score > 0)
     .sort((a, b) => b.score - a.score)
     .slice(0, 3)
     .sort((a, b) => a.i - b.i)
-    .map(x => x.s.trim());
-  const cleaned = top.map(s =>
-    s.replace(/^[^A-Z"(]+/, '').replace(/\s+/g, ' ').trim()
-  ).filter(s => s.length > 30);
-  return cleaned.join(' ');
+    .map(x => x.s.replace(/^[^A-Z"(]+/, '').replace(/\s+/g,' ').trim())
+    .filter(s => s.length > 30);
+  return top.join(' ');
 }
 
 
@@ -493,14 +499,16 @@ async function fetchNews(ticker) {
     const batch = base.slice(i, i + CONCURRENCY);
     const results = await Promise.all(batch.map(async item => {
       const titleEn = item.translatedTitle || item.title;
-      let summary = item._rssSum;
-      // Only scrape if RSS gave us no useful description
-      if (!summary || summary.length < 80) {
-        const bodyText = await scrapeArticle(item.url);
-        if (bodyText) {
-          const extracted = extractiveSummarise(bodyText, titleEn, ticker);
-          if (extracted && extracted.length > 60) summary = extracted;
-        }
+      let summary = '';
+      // Always attempt to scrape the real article for a proper summary
+      const bodyText = await scrapeArticle(item.url);
+      if (bodyText) {
+        const extracted = extractiveSummarise(bodyText, titleEn, ticker);
+        if (extracted && extracted.length > 60) summary = extracted;
+      }
+      // Fall back to RSS description only if scrape failed or returned nothing
+      if (!summary && item._rssSum && item._rssSum.length > 60) {
+        summary = item._rssSum;
       }
       const { _rssSum, ...clean } = item;
       return { ...clean, summary: summary || '' };
