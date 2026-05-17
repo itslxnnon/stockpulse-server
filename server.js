@@ -16,8 +16,54 @@ function setCached(k,d){ cache.set(k,{data:d,ts:Date.now()}); }
 async function scrapeArticle(articleUrl) {
   if (!articleUrl || !articleUrl.startsWith('http')) return '';
   const BLOCKED = ['wsj.com','ft.com','barrons.com','bloomberg.com','seekingalpha.com','economist.com','hbr.org','theatlantic.com','newyorker.com'];
-  try { const host = new URL(articleUrl).hostname; if (BLOCKED.some(b => host.includes(b))) return ''; } catch(e) { return ''; }
-  try { return extractBodyText(await fetchArticleHTML(articleUrl, 10000)); } catch(e) { return ''; }
+  
+  // If it's a Google News redirect URL, resolve it to the real article URL first
+  let realUrl = articleUrl;
+  if (articleUrl.includes('news.google.com')) {
+    try {
+      realUrl = await resolveGoogleNewsUrl(articleUrl);
+    } catch(e) { return ''; }
+  }
+  
+  try { const host = new URL(realUrl).hostname; if (BLOCKED.some(b => host.includes(b))) return ''; } catch(e) { return ''; }
+  try { return extractBodyText(await fetchArticleHTML(realUrl, 12000)); } catch(e) { return ''; }
+}
+
+// Follows Google News redirect to get the actual article URL
+function resolveGoogleNewsUrl(googleUrl) {
+  return new Promise((resolve, reject) => {
+    let redirects = 0;
+    function go(u) {
+      try {
+        const p = new URL(u);
+        const req = require('https').request({
+          hostname: p.hostname, port: 443,
+          path: p.pathname + (p.search||''),
+          method: 'GET',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'text/html,*/*',
+          },
+          timeout: 8000,
+        }, res => {
+          if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location) {
+            let next = res.headers.location;
+            if (!next.startsWith('http')) next = 'https://' + p.hostname + next;
+            // If we've reached a non-google URL, that's our real article
+            if (!next.includes('google.com') || redirects > 3) { res.resume(); resolve(next); return; }
+            redirects++;
+            res.resume(); go(next); return;
+          }
+          // No redirect — the current URL IS the article (or we're on the article page)
+          res.resume(); resolve(u);
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+        req.end();
+      } catch(e) { reject(e); }
+    }
+    go(googleUrl);
+  });
 }
 
 // Browser-like article fetcher — streams only first 80KB, follows redirects
@@ -144,7 +190,7 @@ function extractiveSummarise(bodyText, title, ticker) {
   });
   // Take top 4 by score, restore original order, join as paragraph
   const top = scored
-    .filter(x => x.score > 2)
+    .filter(x => x.score >= 0)
     .sort((a,b) => b.score - a.score)
     .slice(0, 4)
     .sort((a,b) => a.i - b.i)
@@ -191,30 +237,49 @@ function headlineSummary(title, ticker, source, sentiment) {
 }
 function buildFeeds(ticker) {
   const e = s => encodeURIComponent(s);
+  // Company name lookup for small/mid caps that have few ticker-only results
+  const COMPANY_NAMES = {
+    'SIVE': 'Sivers Semiconductors', 'SIVEF': 'Sivers Semiconductors',
+    'LPK': 'Lorillard', 'NVDA': 'NVIDIA', 'AAPL': 'Apple',
+    'TSLA': 'Tesla', 'AMZN': 'Amazon', 'MSFT': 'Microsoft',
+    'META': 'Meta', 'GOOG': 'Alphabet', 'GOOGL': 'Alphabet',
+  };
+  const company = COMPANY_NAMES[ticker] || '';
   const t = ticker;
-  const w = 'when:14d '; // limit Google News results to last 14 days
-  return [
-    `https://news.google.com/rss/search?q=${e(w+t+' stock news')}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e(w+'"'+t+'" stock')}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e(w+t+' shares earnings')}&hl=en-GB&gl=GB&ceid=GB:en`,
-    `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${e(t)}&region=US&lang=en-US`,
-    `https://www.nasdaq.com/feed/rssoutbound?symbol=${e(t)}`,
-    `https://news.google.com/rss/search?q=${e(w+'site:reuters.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e(w+'site:cnbc.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e(w+'site:ft.com '+t)}&hl=en-GB&gl=GB&ceid=GB:en`,
-    `https://news.google.com/rss/search?q=${e(w+'site:marketwatch.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e(w+'site:seekingalpha.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e(w+'site:bloomberg.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e(w+'site:barrons.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e(w+'site:wsj.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e(w+t+' Aktie')}&hl=de-DE&gl=DE&ceid=DE:de`,
-    `https://news.google.com/rss/search?q=${e(w+t+' action bourse')}&hl=fr-FR&gl=FR&ceid=FR:fr`,
-    `https://news.google.com/rss/search?q=${e(w+t+' azioni borsa')}&hl=it-IT&gl=IT&ceid=IT:it`,
-    `https://news.google.com/rss/search?q=${e(w+t+' 株価')}&hl=ja-JP&gl=JP&ceid=JP:ja`,
-    `https://news.google.com/rss/search?q=${e(w+t+' 股票')}&hl=zh-HK&gl=HK&ceid=HK:zh-Hant`,
-    `https://news.google.com/rss/search?q=${e(w+'$'+t+' stock')}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e(w+t+' investor news')}&hl=en-US&gl=US&ceid=US:en`,
+  // Build query variants — ticker alone, with company name, exchange-prefixed
+  const queries = [
+    t + ' stock',
+    '"' + t + '" shares',
+    t + ' investor news',
+    t + ' earnings results',
+    '$' + t + ' stock',
   ];
+  // If we have a company name, add company-name queries (much more effective for small caps)
+  if (company) {
+    queries.push('"' + company + '"');
+    queries.push('"' + company + '" stock');
+    queries.push('"' + company + '" shares');
+    queries.push('"' + company + '" results');
+    queries.push('"' + company + '" valuation');
+  }
+  // Also try exchange-prefixed formats
+  queries.push('OM:' + t); // Nordic exchange
+  queries.push('OTCMKTS:' + t + 'EF'); // OTC pink sheet variant
+  
+  const feeds = queries.map(q =>
+    `https://news.google.com/rss/search?q=${e(q)}&hl=en-US&gl=US&ceid=US:en`
+  );
+  // Add non-Google sources
+  feeds.push(`https://feeds.finance.yahoo.com/rss/2.0/headline?s=${e(t)}&region=US&lang=en-US`);
+  feeds.push(`https://www.nasdaq.com/feed/rssoutbound?symbol=${e(t)}`);
+  // International Google News for foreign language coverage
+  if (company) {
+    feeds.push(`https://news.google.com/rss/search?q=${e('"'+company+'"')}&hl=sv-SE&gl=SE&ceid=SE:sv`); // Swedish (listed on Nasdaq Stockholm)
+    feeds.push(`https://news.google.com/rss/search?q=${e('"'+company+'"')}&hl=ja-JP&gl=JP&ceid=JP:ja`);
+    feeds.push(`https://news.google.com/rss/search?q=${e('"'+company+'"')}&hl=zh-HK&gl=HK&ceid=HK:zh-Hant`);
+    feeds.push(`https://news.google.com/rss/search?q=${e('"'+company+'"')}&hl=de-DE&gl=DE&ceid=DE:de`);
+  }
+  return feeds;
 }
 
 // ── HTTP fetch ────────────────────────────────────────────────────────────────
@@ -311,19 +376,31 @@ function dedup(items) {
 function isRelevant(item, ticker) {
   const tLow = ticker.toLowerCase();
   const title = (item.title || '').toLowerCase();
-  // Strip punctuation and split into words — but also keep $ticker format
+  const desc  = (item.description || '').toLowerCase();
+  const combined = title + ' ' + desc;
+  
+  // Known company names for small-cap tickers
+  const COMPANY = {
+    'sive': 'sivers semiconductors', 'sivef': 'sivers semiconductors',
+    'lpk': 'lorillard',
+  };
+  const companyName = COMPANY[tLow];
+  
+  // Check company name match in title (covers articles that don't use ticker symbol)
+  if (companyName && title.includes(companyName)) return true;
+  
+  // Strip punctuation, split into words, check for exact ticker word
   const titleWords = title.replace(/[^a-z0-9:$\s]/g, ' ').split(/\s+/);
-  // Match: exact word, $TICKER format, or exchange:ticker (OM:SIVE, OTCMKTS:SIVEF)
   const directMatch = titleWords.some(w =>
     w === tLow ||
     w === '$' + tLow ||
     w === tLow + ':' ||
-    w.endsWith(':' + tLow)
+    w.endsWith(':' + tLow) ||
+    // Handle OTC variants like SIVEF for SIVE
+    (tLow.length >= 3 && w.startsWith(tLow) && w.length <= tLow.length + 2)
   );
   if (directMatch) return true;
-  // exchange:ticker substring (handles om:sive inside a longer string)
   if (title.includes(':' + tLow)) return true;
-  // $ticker substring
   if (title.includes('$' + tLow)) return true;
   return false;
 }
@@ -591,14 +668,14 @@ async function fetchNews(ticker) {
   const src = relevant.length > 0 ? relevant : [];
   src.sort((a, b) => { try { return new Date(b.pubDate) - new Date(a.pubDate); } catch (e) { return 0; } });
   // Filter to last 14 days — reject anything older
-  const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
   const recent = src.filter(item => {
     try { return new Date(item.pubDate).getTime() >= cutoff; } catch(e) { return false; }
   });
   // Use recent if we have any, otherwise fall back to src (so we always show something)
   const final = recent.length > 0 ? recent : src;
   const top15 = final.slice(0, 15);
-  console.log('[RECENCY]', ticker, '—', src.length, 'relevant,', recent.length, 'within 14d, using', top15.length);
+  console.log('[RECENCY]', ticker, '—', src.length, 'relevant,', recent.length, 'within 30d, using', top15.length);
 
   // Build base article metadata synchronously
   const base = top15.map(item => {
