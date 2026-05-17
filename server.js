@@ -12,6 +12,51 @@ const CACHE_TTL = 5 * 60 * 1000;
 function getCached(k){ const e=cache.get(k); if(!e||Date.now()-e.ts>CACHE_TTL){cache.delete(k);return null;} return e.data; }
 function setCached(k,d){ cache.set(k,{data:d,ts:Date.now()}); }
 
+// ── Claude Haiku summariser (fallback when scraping fails) ───────────────────
+// Uses claude-haiku — costs ~$0.001 per 15 articles. Requires ANTHROPIC_API_KEY env var.
+// If no key is set, this returns '' and the RSS description fallback kicks in.
+async function callClaudeForSummary(title, rssDesc, ticker) {
+  const key = process.env.ANTHROPIC_API_KEY;
+  if (!key) return '';
+  // Build context: use RSS description if it adds info beyond the title
+  const extra = (rssDesc && rssDesc.length > 40 && rssDesc.toLowerCase() !== title.toLowerCase())
+    ? '\nAdditional context from feed: ' + rssDesc.slice(0, 300)
+    : '';
+  const prompt = 'You are a financial news analyst. Read this article headline and write a factual 2-3 sentence summary explaining: (1) what specifically happened or was announced, (2) why it matters for investors in ' + ticker + '. Be concrete — include numbers, names, dates if present in the headline. Do not start with "This article". Write only the summary, nothing else.\n\nHeadline: ' + title + extra;
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: prompt }]
+    });
+    const req = https.request({
+      hostname: 'api.anthropic.com', port: 443, path: '/v1/messages', method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01',
+        'Content-Length': Buffer.byteLength(body)
+      },
+      timeout: 15000,
+    }, res => {
+      const chunks = [];
+      res.on('data', c => chunks.push(c));
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(Buffer.concat(chunks).toString());
+          resolve(j.content?.[0]?.text?.trim() || '');
+        } catch(e) { resolve(''); }
+      });
+      res.on('error', () => resolve(''));
+    });
+    req.on('error', () => resolve(''));
+    req.on('timeout', () => { req.destroy(); resolve(''); });
+    req.write(body);
+    req.end();
+  });
+}
+
+
 // ── Article scraper ───────────────────────────────────────────────────────────
 async function scrapeArticle(articleUrl) {
   if (!articleUrl || !articleUrl.startsWith('http')) return '';
@@ -684,17 +729,23 @@ async function fetchNews(ticker) {
     const results = await Promise.all(batch.map(async item => {
       const titleEn = item.translatedTitle || item.title;
       let summary = '';
-      // 1. Try scraping the real article
+      // 1. Try scraping the real article for full text
       const bodyText = await scrapeArticle(item.url);
       if (bodyText) {
         const extracted = extractiveSummarise(bodyText, titleEn, ticker);
         if (extracted && extracted.length > 60) summary = extracted;
       }
-      // 2. Fall back to RSS description if scrape yielded nothing
+      // 2. Try RSS description if scrape yielded nothing useful
       if (!summary && item._rssSum && item._rssSum.length > 60) {
         summary = item._rssSum;
       }
-      // 3. No good summary — leave blank rather than fabricate
+      // 3. Call Claude Haiku to generate a summary from the headline
+      //    (requires ANTHROPIC_API_KEY env var on Render — costs ~$0.001 per search)
+      if (!summary) {
+        summary = await callClaudeForSummary(titleEn, item._rssSum || '', ticker);
+      }
+      // 4. Log result so Render logs show what happened
+      console.log('[SUMMARY]', item.source, '|', summary ? 'OK '+summary.length+'ch' : 'EMPTY', '|', titleEn.slice(0,50));
       const { _rssSum, ...clean } = item;
       return { ...clean, summary };
     }));
