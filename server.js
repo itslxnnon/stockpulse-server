@@ -15,47 +15,90 @@ function setCached(k,d){ cache.set(k,{data:d,ts:Date.now()}); }
 // ── Article scraper ───────────────────────────────────────────────────────────
 async function scrapeArticle(articleUrl) {
   if (!articleUrl || !articleUrl.startsWith('http')) return '';
-  const blocked = ['wsj.com','ft.com','barrons.com','bloomberg.com','seekingalpha.com','economist.com','hbr.org'];
-  try {
-    const host = new URL(articleUrl).hostname;
-    if (blocked.some(b => host.includes(b))) return '';
-  } catch(e) { return ''; }
-  try {
-    const html = await fetchURL(articleUrl, 10000);
-    return extractBodyText(html);
-  } catch(e) { return ''; }
+  const BLOCKED = ['wsj.com','ft.com','barrons.com','bloomberg.com','seekingalpha.com','economist.com','hbr.org','theatlantic.com','newyorker.com'];
+  try { const host = new URL(articleUrl).hostname; if (BLOCKED.some(b => host.includes(b))) return ''; } catch(e) { return ''; }
+  try { return extractBodyText(await fetchArticleHTML(articleUrl, 10000)); } catch(e) { return ''; }
+}
+
+// Browser-like article fetcher — streams only first 80KB, follows redirects
+function fetchArticleHTML(targetUrl, ms) {
+  ms = ms || 10000;
+  return new Promise((resolve, reject) => {
+    let redirects = 0;
+    function go(u) {
+      let parsed; try { parsed = new URL(u); } catch(e) { return reject(e); }
+      const lib = parsed.protocol === 'https:' ? https : http;
+      const req = lib.request({
+        hostname: parsed.hostname,
+        port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+        path: parsed.pathname + (parsed.search || ''),
+        method: 'GET',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'identity',
+          'Cache-Control': 'no-cache',
+          'Connection': 'close',
+        },
+        timeout: ms,
+      }, res => {
+        if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location && redirects++ < 4) {
+          let next = res.headers.location;
+          if (!next.startsWith('http')) next = parsed.protocol + '//' + parsed.hostname + next;
+          res.resume(); go(next); return;
+        }
+        if (res.statusCode !== 200) { res.resume(); reject(new Error('HTTP ' + res.statusCode)); return; }
+        const chunks = []; let total = 0;
+        res.on('data', chunk => {
+          chunks.push(chunk); total += chunk.length;
+          if (total > 80000) { req.destroy(); resolve(Buffer.concat(chunks).toString('utf-8')); }
+        });
+        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
+        res.on('error', reject);
+      });
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
+      req.end();
+    }
+    go(targetUrl);
+  });
 }
 
 function extractBodyText(html) {
   if (!html) return '';
-  let t = html
-    // Remove entire non-content element blocks including their contents
-    .replace(/<(script|style|noscript|iframe|header|footer|nav|aside|form|menu|menuitem|figure|figcaption|picture|svg|canvas|dialog|details|summary)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
-    // Remove meta, link, input tags
-    .replace(/<(meta|link|input|button|select|option|textarea|label)[^>]*\/?>/gi, ' ')
-    // Strip all remaining tags
+
+  // Step 1: Try to isolate the main article content zone
+  let zone = '';
+  const articleM = html.match(/<article[^>]*>([\s\S]{300,}?)<\/article>/i);
+  const mainM    = html.match(/<main[^>]*>([\s\S]{300,}?)<\/main>/i);
+  if (articleM)   zone = articleM[1];
+  else if (mainM) zone = mainM[1];
+  else            zone = html;
+
+  // Step 2: Strip non-prose elements
+  let t = zone
+    .replace(/<(script|style|noscript|iframe|header|footer|nav|aside|form|menu|figure|figcaption|picture|svg|canvas|dialog)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<(meta|link|input|button|select|option|textarea|label|img|br|hr)[^>]*\/?>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
     .replace(/<[^>]+>/g, ' ')
-    // Decode entities
     .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
     .replace(/&[a-z#0-9]+;/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+    .replace(/\s+/g, ' ').trim();
 
-  // Split into candidate sentences
-  const raw = t.replace(/([.!?])\s+([A-Z"'(])/g, '$1☃$2').split('☃');
+  // Step 3: Split sentences and filter boilerplate
+  const raw = t.replace(/([.!?])\s+([A-Z"'(])/g, '$1\u2603$2').split('\u2603');
 
-  // Patterns that indicate boilerplate/nav/cookie/ui text — discard these sentences
-  const BOILERPLATE = /^(cookie|subscribe|sign in|log in|click here|all rights|privacy|terms of|advertisement|read more|share this|follow us|newsletter|by clicking|you may also|related article|loading|skip to|jump to|back to|home\s|search\s|menu\s|navigation|site map|contact us|about us|careers|investor relations|press release|copyright|sponsored|advertisement|more from|most popular|trending now|also read|see also|watch now|listen now|get the|download the|open the|update your|enable javascript|this website uses|we use cookies|accept cookies|manage cookies|your privacy|data protection|gdpr|please enable|browser not supported|javascript is|for the best experience|version of this page|accessibility|language selector|select language|change language|edition:|us edition|uk edition|international edition|sign up for|get unlimited access|already a subscriber|start your free|try for free|cancel anytime|no commitment|exclusive to|members only|premium content|paywalled|register now|create account|forgot password|reset password|send me|email address|enter your|confirm your|verify your|thank you for|you have successfully|welcome back|good morning|good evening|breaking news:|live updates|live blog|as it happened|follow live|join the conversation|leave a comment|post a comment|comments section|show comments|hide comments|be the first|share your thoughts|have your say|write a review|rate this|was this helpful|report this|flag this|save for later|add to|remove from|shopping cart|checkout|proceed to|place order|free delivery|returns policy|customer service|help centre|faq|sitemap|xml|rss feed|podcast|video|gallery|photos|images|slideshow|infographic|interactive|quiz|survey|poll)/i;
+  const JUNK = /^(cookie|accept all|we use|privacy|terms|subscribe|sign in|log in|register|get access|advertisement|sponsored|follow us|share this|most popular|trending|related:|you may|see also|read next|read more|more from|load more|show more|click here|tap here|skip|jump to|back to top|home page|search results|no results|data unavailable|could not find|javascript|please enable|accessibility|edition:|breaking news|live blog|newsletter|download app|copyright|all rights reserved|powered by|built with|opt out|gdpr|ccpa)/i;
 
   const sentences = raw.map(s => s.trim()).filter(s => {
-    if (s.length < 40 || s.length > 800) return false;
+    if (s.length < 50 || s.length > 900) return false;
     if (!/^[A-Z"'(]/.test(s)) return false;
-    if (s.split(' ').length < 7) return false;
-    if (BOILERPLATE.test(s)) return false;
-    // Discard sentences that are mostly short nav-style words (ratio check)
-    const words = s.split(' ');
-    const shortWords = words.filter(w => w.length <= 3).length;
-    if (shortWords / words.length > 0.6) return false;
+    if (s.split(/\s+/).length < 8) return false;
+    if (JUNK.test(s)) return false;
+    const words = s.split(/\s+/);
+    if (words.filter(w => w.length <= 3).length / words.length > 0.55) return false;
+    if (words.filter(w => w.length > 1 && w === w.toUpperCase() && /^[A-Z]+$/.test(w)).length / words.length > 0.35) return false;
     return true;
   });
 
@@ -261,8 +304,17 @@ function dedup(items) {
   return items.filter(a => { const k = a.title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 55); if (seen.has(k)) return false; seen.add(k); return true; });
 }
 function isRelevant(item, ticker) {
-  const text = (item.title + ' ' + item.description + ' ' + (item.link || '')).toLowerCase();
-  return text.includes(ticker.toLowerCase());
+  const tLow = ticker.toLowerCase();
+  const title = (item.title || '').toLowerCase();
+  // Require the ticker to appear as a standalone word or exchange prefix in the title
+  // This prevents "SIVE" matching inside "exclusive", "massive", "pervasive" etc.
+  // Simple approach: split title into words and check for exact match
+  const titleWords = title.replace(/[^a-z0-9:\s]/g, ' ').split(/\s+/);
+  const directMatch = titleWords.some(w => w === tLow || w === tLow + ':' || w.endsWith(':' + tLow));
+  if (directMatch) return true;
+  // Also allow exchange:ticker format like om:sive, nasdaq:aapl
+  if (title.includes(':' + tLow)) return true;
+  return false;
 }
 
 // ── Language detection ────────────────────────────────────────────────────────
@@ -556,10 +608,7 @@ async function fetchNews(ticker) {
       if (!summary && item._rssSum && item._rssSum.length > 60) {
         summary = item._rssSum;
       }
-      // 3. Always guaranteed: generate from headline if everything else failed
-      if (!summary) {
-        summary = headlineSummary(titleEn, ticker, item.source, item.sentiment);
-      }
+      // 3. No good summary — leave blank rather than fabricate
       const { _rssSum, ...clean } = item;
       return { ...clean, summary };
     }));
