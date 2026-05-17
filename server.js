@@ -97,8 +97,31 @@ function parseRSS(xml, feedUrl) {
 }
 function tag(x, n) { const m = x.match(new RegExp('<' + n + '[^>]*>([\\s\\S]*?)</' + n + '>', 'i')); return m ? m[1].trim() : ''; }
 function attr(x, n, a) { const m = x.match(new RegExp('<' + n + '[^>]*' + a + '="([^"]*)"', 'i')); return m ? m[1] : ''; }
-function clean(s) { return s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/<[^>]+>/g, '').trim(); }
-function h2t(s) { return s.replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim(); }
+function clean(s) { return decodeEntities(s.replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1').replace(/<[^>]+>/g, '')).trim(); }
+function decodeEntities(s) {
+  // Named entities
+  s = s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+       .replace(/&#39;/g, "'").replace(/&apos;/g, "'").replace(/&nbsp;/g, ' ')
+       .replace(/&mdash;/g, '—').replace(/&ndash;/g, '–').replace(/&lsquo;/g, '\u2018')
+       .replace(/&rsquo;/g, '\u2019').replace(/&ldquo;/g, '\u201C').replace(/&rdquo;/g, '\u201D')
+       .replace(/&hellip;/g, '…').replace(/&bull;/g, '·').replace(/&trade;/g, '™')
+       .replace(/&reg;/g, '®').replace(/&copy;/g, '©').replace(/&euro;/g, '€')
+       .replace(/&pound;/g, '£').replace(/&yen;/g, '¥');
+  // Hex numeric entities e.g. &#x2014; &#x2018; &#x201C;
+  s = s.replace(/&#x([0-9a-fA-F]+);/g, (_, hex) => {
+    try { return String.fromCodePoint(parseInt(hex, 16)); } catch(e) { return ''; }
+  });
+  // Decimal numeric entities e.g. &#8212; &#8216;
+  s = s.replace(/&#([0-9]+);/g, (_, dec) => {
+    try { return String.fromCodePoint(parseInt(dec, 10)); } catch(e) { return ''; }
+  });
+  return s;
+}
+function h2t(s) {
+  return decodeEntities(
+    s.replace(/<br\s*\/?>/gi, ' ').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ')
+  ).trim();
+}
 function googleLink(l) { if (!l) return ''; const m = l.match(/(?:url|q)=([^&]+)/i); if (m) { try { return decodeURIComponent(m[1]); } catch (e) { } } return l; }
 function domainOf(u) {
   try {
@@ -330,12 +353,24 @@ function sentiment(title, desc) {
 
 // ── Summary generation ────────────────────────────────────────────────────────
 function makeSummary(title, desc, sent, ticker) {
-  const d = (desc && desc.length > 40) ? desc : null;
-  const context = d ? d : title;
-  const prefix = sent === 'bullish' ? `Bullish for ${ticker}: ` : sent === 'bearish' ? `Bearish for ${ticker}: ` : `Neutral update for ${ticker}: `;
-  const cleaned = context.replace(/\s+/g, ' ').trim();
-  const sentence = cleaned.length > 160 ? cleaned.slice(0, 157) + '…' : cleaned;
-  return prefix + sentence;
+  // Use description if it's substantive and different from the title
+  const rawDesc = (desc || '').trim();
+  const cleanDesc = decodeEntities(rawDesc.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim());
+
+  // Strip any residual URLs that leaked into the description
+  const noUrls = cleanDesc.replace(/https?:\/\/\S+/g, '').replace(/\s+/g, ' ').trim();
+
+  // Use description if it's long enough and meaningfully different from title
+  const useDesc = noUrls.length > 60 && noUrls.toLowerCase().slice(0, 40) !== title.toLowerCase().slice(0, 40);
+  const base = useDesc ? noUrls : title;
+
+  // Trim to a readable length at a sentence or word boundary
+  let summary = base.length > 220 ? base.slice(0, 217) + '…' : base;
+
+  // Construct a clean sentence: remove trailing source attribution (e.g. "- MarketWatch")
+  summary = summary.replace(/\s*[-–—]\s*(MarketWatch|Reuters|CNBC|Bloomberg|Yahoo Finance|Financial Times|Barron's|Nasdaq|BBC|Seeking Alpha|WSJ|FT|Forbes|Business Insider|The Guardian|AP|Associated Press)\.?\s*$/i, '');
+
+  return summary.trim();
 }
 
 function relTime(str) {
@@ -393,38 +428,152 @@ async function fetchNews(ticker) {
   return articles;
 }
 
+// ── Bottleneck / opportunity keyword detector ─────────────────────────────────
+// Maps keywords found in headlines → sector problem + investable angle
+const OPPORTUNITY_MAP = [
+  // Interconnect / bandwidth
+  { keys: ['copper','interconnect','bandwidth','latency','cable','wiring','signal integrity'],
+    problem: 'data centre interconnect bandwidth bottleneck',
+    sector: 'Silicon Photonics & Optical Interconnects',
+    cos: 'Coherent Corp (COHR), II-VI / Coherent (IIVI), Lumentum (LITE), Inphi (acquired by Marvell), Ayar Labs (private), Marvell Technology (MRVL)' },
+  // Photonics
+  { keys: ['photon','photonic','optical','laser','lidar'],
+    problem: 'optical interconnect and sensing demand surge',
+    sector: 'Photonics & Optical Components',
+    cos: 'Lumentum (LITE), Coherent Corp (COHR), II-VI (IIVI), IPG Photonics (IPGP), Ii-Vi Incorporated, Viavi Solutions (VIAV)' },
+  // Power / energy
+  { keys: ['power consumption','energy','cooling','thermal','heat','watt','electricity','grid','power usage'],
+    problem: 'soaring power and cooling demands in AI/data centre infrastructure',
+    sector: 'Power Management & Data Centre Cooling',
+    cos: 'Vertiv Holdings (VRT), Eaton (ETN), Amphenol (APH), nVent Electric (NVT), Bloom Energy (BE), Schneider Electric (SU.PA)' },
+  // Memory / HBM
+  { keys: ['hbm','memory','dram','bandwidth','stacking','packaging'],
+    problem: 'memory bandwidth wall constraining AI accelerator performance',
+    sector: 'Advanced Memory & HBM',
+    cos: 'SK Hynix (000660.KS), Micron Technology (MU), Samsung Electronics (005930.KS), Rambus (RMBS)' },
+  // Advanced packaging
+  { keys: ['packaging','chiplet','cowos','advanced packaging','interposer','tsmc'],
+    problem: 'advanced chip packaging capacity shortage',
+    sector: 'Advanced Semiconductor Packaging',
+    cos: 'ASE Technology (ASX), Amkor Technology (AMKR), SPIL, Kulicke & Soffa (KLIC), Brewer Science (private)' },
+  // Supply chain / shortage
+  { keys: ['supply chain','shortage','supply constraint','lead time','inventory','backlog'],
+    problem: 'supply chain disruption and component shortages',
+    sector: 'Supply Chain Resilience & Distribution',
+    cos: 'Flex Ltd (FLEX), Jabil (JBL), Celestica (CLS), Arrow Electronics (ARW), Avnet (AVT)' },
+  // Cybersecurity
+  { keys: ['cyber','hack','breach','security','ransomware','vulnerability','attack','malware'],
+    problem: 'escalating cybersecurity threats and breach risk',
+    sector: 'Cybersecurity',
+    cos: 'CrowdStrike (CRWD), Palo Alto Networks (PANW), SentinelOne (S), Fortinet (FTNT), Zscaler (ZS)' },
+  // AI / inference
+  { keys: ['ai','artificial intelligence','inference','training','llm','large language','generative'],
+    problem: 'AI infrastructure build-out demand driving component suppliers',
+    sector: 'AI Infrastructure & Accelerators',
+    cos: 'Nvidia (NVDA), Broadcom (AVGO), Marvell Technology (MRVL), Super Micro Computer (SMCI), Dell Technologies (DELL)' },
+  // Semiconductor equipment
+  { keys: ['fab','fabrication','foundry','wafer','lithography','etch','deposition','equipment'],
+    problem: 'semiconductor fabrication capacity and equipment demand',
+    sector: 'Semiconductor Capital Equipment',
+    cos: 'ASML (ASML), Lam Research (LRCX), KLA Corp (KLAC), Applied Materials (AMAT), Tokyo Electron (8035.T)' },
+  // EV / Battery
+  { keys: ['battery','ev','electric vehicle','charging','cathode','anode','lithium','solid state'],
+    problem: 'EV battery supply and energy density constraints',
+    sector: 'EV Battery Technology & Materials',
+    cos: 'QuantumScape (QS), Albemarle (ALB), Livent (LTHM), Panasonic (6752.T), CATL (300750.SZ), SQM (SQM)' },
+  // Software / cloud migration
+  { keys: ['cloud','migration','saas','subscription','digital transformation','software'],
+    problem: 'enterprise cloud migration and SaaS platform expansion',
+    sector: 'Cloud Infrastructure & SaaS',
+    cos: 'Microsoft (MSFT), Amazon Web Services (AMZN), Snowflake (SNOW), Palantir (PLTR), ServiceNow (NOW)' },
+  // Regulatory / compliance
+  { keys: ['regulation','regulatory','compliance','antitrust','investigation','sanction','tariff','ban','export control'],
+    problem: 'regulatory and geopolitical headwinds constraining growth',
+    sector: 'Regulatory Compliance & Legal Tech',
+    cos: 'Wolters Kluwer (WKL.AS), Dun & Bradstreet (DNB), Navex Global (private), MSCI (MSCI)' },
+  // Healthcare / biotech constraints
+  { keys: ['clinical trial','fda','approval','drug','therapy','biotech','pharma','patent'],
+    problem: 'drug approval pipeline and patent cliff risks',
+    sector: 'Contract Research & Drug Manufacturing',
+    cos: 'ICON Plc (ICLR), Lonza Group (LONN.SW), Catalent (CTLT), Charles River Labs (CRL), Thermo Fisher (TMO)' },
+  // Logistics / shipping
+  { keys: ['shipping','freight','port','logistics','container','delivery','warehouse'],
+    problem: 'logistics and freight cost pressures',
+    sector: 'Freight & Logistics Technology',
+    cos: 'XPO Logistics (XPO), Saia Inc (SAIA), Old Dominion (ODFL), Descartes Systems (DSGX), Flexport (private)' },
+  // Listing / IPO / capital markets
+  { keys: ['ipo','listing','nasdaq listing','us listing','public offering','capital raise'],
+    problem: 'capital market access and US listing requirements',
+    sector: 'Investment Banking & Market Infrastructure',
+    cos: 'Nasdaq Inc (NDAQ), Intercontinental Exchange (ICE), Goldman Sachs (GS), Morgan Stanley (MS)' },
+];
+
+function detectOpportunities(articles) {
+  const allText = articles.map(a => (a.translatedTitle || a.title) + ' ' + (a.summary || '')).join(' ').toLowerCase();
+  const found = [];
+  for (const opp of OPPORTUNITY_MAP) {
+    const matchedKeys = opp.keys.filter(k => allText.includes(k));
+    if (matchedKeys.length >= 1) {
+      found.push({ ...opp, matched: matchedKeys });
+    }
+  }
+  // Deduplicate by sector, return top 3 most-matched
+  const seen = new Set();
+  return found
+    .sort((a, b) => b.matched.length - a.matched.length)
+    .filter(o => { if (seen.has(o.sector)) return false; seen.add(o.sector); return true; })
+    .slice(0, 3);
+}
+
 // ── Thesis generation ────────────────────────────────────────────────────────
 function generateThesis(ticker, articles) {
   if (!articles || !articles.length) return 'Insufficient news data to generate a thesis.';
-  const bull = articles.filter(a => a.sentiment === 'bullish');
-  const bear = articles.filter(a => a.sentiment === 'bearish');
+  const bull  = articles.filter(a => a.sentiment === 'bullish');
+  const bear  = articles.filter(a => a.sentiment === 'bearish');
   const bullTitles = bull.slice(0, 3).map(a => a.translatedTitle || a.title).join('; ');
   const bearTitles = bear.slice(0, 3).map(a => a.translatedTitle || a.title).join('; ');
   const tot = articles.length;
   const dominance = bull.length > bear.length ? 'bullish' : bear.length > bull.length ? 'bearish' : 'mixed';
-  let thesis = '';
+  const opps = detectOpportunities(articles);
 
+  // ── Section 1: Current picture ──────────────────────────────
+  let thesis = '';
   if (dominance === 'bullish') {
-    thesis += `Current picture: ${ticker} is generating predominantly positive news flow, with ${bull.length} out of ${tot} recent articles carrying bullish signals. Key themes include: ${bullTitles.slice(0, 180)}. This suggests improving fundamentals, positive market perception, or strong operational momentum that the market has yet to fully price in.`;
+    thesis += `📊 Current Picture\n\n${ticker} is generating predominantly positive news flow — ${bull.length} of ${tot} recent articles carry bullish signals. Key themes: ${bullTitles.slice(0, 200)}. This suggests improving fundamentals or strong operational momentum not yet fully priced in by the market.`;
   } else if (dominance === 'bearish') {
-    thesis += `Current picture: ${ticker} faces a challenging news environment, with ${bear.length} out of ${tot} recent articles carrying bearish signals. Headwinds include: ${bearTitles.slice(0, 180)}. This pattern of negative news can indicate deteriorating fundamentals, sector-level pressure, or company-specific issues requiring close monitoring.`;
+    thesis += `📊 Current Picture\n\n${ticker} faces a challenging news environment — ${bear.length} of ${tot} articles carry bearish signals. Key headwinds: ${bearTitles.slice(0, 200)}. This may indicate deteriorating fundamentals, sector pressure, or company-specific issues requiring close monitoring.`;
   } else {
-    thesis += `Current picture: News flow for ${ticker} is balanced, with ${bull.length} bullish and ${bear.length} bearish signals across ${tot} articles. This mixed environment suggests the market is at a pivotal decision point — watching upcoming catalysts such as earnings, guidance updates, or macro developments will be critical to establishing directional conviction.`;
+    thesis += `📊 Current Picture\n\nNews flow for ${ticker} is balanced: ${bull.length} bullish vs ${bear.length} bearish signals across ${tot} articles. The market appears to be at a pivotal decision point — directional conviction will likely come from the next earnings release, guidance update, or macro catalyst.`;
   }
 
-  thesis += `\n\nChain-effect outlook: ${dominance === 'bullish'
-    ? `If the current bullish momentum for ${ticker} is sustained, several compounding effects could follow. Positive earnings or analyst upgrades typically trigger institutional buying, which in turn improves short-term liquidity and reduces bid-ask spreads. Revenue growth, if confirmed, could support margin expansion as fixed costs are spread over a larger revenue base, creating a virtuous cycle of improving profitability.`
-    : dominance === 'bearish'
-    ? `Sustained negative news for ${ticker} risks creating a self-reinforcing downward spiral. Analyst downgrades often follow negative news cycles, triggering institutional de-risking. Deteriorating sentiment can increase the cost of capital — equity issuances become dilutive, debt financing becomes expensive — which constrains operational flexibility.`
-    : `In a mixed news environment, the key driver for ${ticker} will be which narrative gains dominance. If the bullish catalysts prove structural rather than transient, the market's current hesitation could represent an accumulation opportunity. Conversely, if bearish signals reflect underlying operational weakness, current valuations may not adequately reflect risk.`
-  }`;
+  // ── Section 2: Chain-effect outlook ─────────────────────────
+  thesis += `\n\n🔗 Chain-Effect Outlook\n\n`;
+  if (dominance === 'bullish') {
+    thesis += `If ${ticker}'s bullish momentum is sustained, several compounding effects could follow. Positive earnings or analyst upgrades typically trigger institutional accumulation, improving liquidity and tightening spreads. For smaller-cap names this snowball is particularly powerful — rising visibility can attract index inclusion consideration, driving passive fund inflows. Confirmed revenue growth could fuel margin expansion as fixed costs are spread over a larger base, creating a virtuous cycle that attracts M&A or strategic partnership interest from larger players.`;
+  } else if (dominance === 'bearish') {
+    thesis += `Sustained negative news for ${ticker} risks a self-reinforcing spiral. Analyst downgrades typically follow prolonged negative cycles, triggering institutional de-risking. Deteriorating sentiment raises the cost of capital — equity raises become dilutive, debt becomes expensive — constraining operational flexibility. For smaller-cap names, reduced liquidity amplifies price moves well beyond fundamental value. The key watchpoint is management's next guidance commentary: a downward revision is often the catalyst that accelerates a de-rating.`;
+  } else {
+    thesis += `The key driver for ${ticker} will be which narrative achieves dominance. If bullish catalysts are structural rather than one-off, current hesitation could represent an accumulation window. Conversely, if bearish signals reflect operational weakness, current prices may not adequately discount the risk. Resolution typically occurs around earnings releases, major contract announcements, or macro inflection points.`;
+  }
 
-  thesis += `\n\nKey risks to monitor: ${dominance === 'bullish'
-    ? `The primary risk to the bullish case is execution — the gap between positive news and delivered results is where most stories break down. Watch for: (1) whether revenue growth translates to margin improvement; (2) sector rotation risk if macro conditions shift; (3) valuation stretch making the name vulnerable to any negative surprise.`
-    : dominance === 'bearish'
-    ? `The primary risk of being overly bearish is overshooting — markets often punish stocks more than fundamentals warrant. Watch for: (1) signs of stabilisation in key metrics indicating the worst is priced in; (2) management restructuring or asset disposals resetting the earnings base; (3) sector-wide recovery catalysts that could lift all boats.`
-    : `Key watchpoints: (1) the next scheduled earnings release and management guidance tone; (2) whether bullish news items reflect one-time events or structural improvements; (3) macro sector tailwinds and headwinds; (4) insider trading activity and institutional position changes as forward-looking sentiment indicators.`
-  }`;
+  // ── Section 3: Identified bottlenecks & adjacent opportunities ──
+  if (opps.length > 0) {
+    thesis += `\n\n🔍 Bottleneck Analysis & Adjacent Investment Opportunities\n\nBased on the news flow for ${ticker}, the following structural challenges and adjacent investment themes have been identified:\n`;
+    for (const opp of opps) {
+      thesis += `\n▸ Problem identified: ${opp.problem.charAt(0).toUpperCase() + opp.problem.slice(1)}.\nThis points to opportunity in: ${opp.sector}.\nCompanies to research: ${opp.cos}.\n`;
+    }
+    thesis += `\nThese are not buy recommendations — they are research starting points based on thematic linkages identified in ${ticker}'s current news flow. Always conduct your own due diligence.`;
+  }
+
+  // ── Section 4: Key risks ─────────────────────────────────────
+  thesis += `\n\n⚠️ Key Risks to Monitor\n\n`;
+  if (dominance === 'bullish') {
+    thesis += `(1) Execution risk — the gap between positive news and delivered results is where most bull cases collapse. Verify that revenue growth translates to margin improvement, not just top-line expansion.\n(2) Sector rotation — macro shifts can de-rate entire sectors regardless of individual fundamentals.\n(3) Valuation stretch — high-momentum names become disproportionately vulnerable to any negative earnings surprise.`;
+  } else if (dominance === 'bearish') {
+    thesis += `(1) Overshooting risk — markets regularly punish stocks beyond what fundamentals warrant; signs of stabilisation may signal a contrarian entry.\n(2) Management response — watch for restructuring plans, asset disposals, or strategic pivots that could reset the earnings base.\n(3) Sector-wide recovery — macro tailwinds or sector catalysts can lift all boats regardless of company-specific issues.`;
+  } else {
+    thesis += `(1) Earnings guidance tone — the next release will likely resolve the current directional ambiguity.\n(2) One-off vs structural — determine whether bullish items are recurring or episodic.\n(3) Insider activity — track director buying/selling and institutional 13F filings as leading sentiment indicators.\n(4) Macro tailwinds — monitor sector-level capital flows which can shift mixed-signal names decisively.`;
+  }
 
   return thesis;
 }
