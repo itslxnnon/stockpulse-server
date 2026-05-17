@@ -5,11 +5,84 @@ const url   = require('url');
 
 const PORT = process.env.PORT || 3000;
 
+
 // ── Cache ─────────────────────────────────────────────────────────────────────
 const cache = new Map();
 const CACHE_TTL = 5 * 60 * 1000;
 function getCached(k){ const e=cache.get(k); if(!e||Date.now()-e.ts>CACHE_TTL){cache.delete(k);return null;} return e.data; }
 function setCached(k,d){ cache.set(k,{data:d,ts:Date.now()}); }
+
+// ── Article scraper ───────────────────────────────────────────────────────────
+async function scrapeArticle(articleUrl) {
+  if (!articleUrl || !articleUrl.startsWith('http')) return '';
+  const blocked = ['wsj.com','ft.com','barrons.com','bloomberg.com','seekingalpha.com','economist.com','hbr.org'];
+  try {
+    const host = new URL(articleUrl).hostname;
+    if (blocked.some(b => host.includes(b))) return '';
+  } catch(e) { return ''; }
+  try {
+    const html = await fetchURL(articleUrl, 8000);
+    return extractBodyText(html);
+  } catch(e) { return ''; }
+}
+
+function extractBodyText(html) {
+  if (!html) return '';
+  let t = html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<(nav|header|footer|aside|form|figure|figcaption|noscript)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&[a-z#0-9]+;/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const sentences = t.split(/(?<=[.!?])\s+(?=[A-Z"(])/).filter(s => {
+    s = s.trim();
+    return s.length > 45 && s.length < 600
+      && /^[A-Z"(]/.test(s)
+      && !/^(Cookie|Subscribe|Sign in|Log in|Click|All rights|Privacy|Terms|Advertisement|Related|Read more|Share|Follow|Newsletter|By clicking)/i.test(s)
+      && (s.match(/\s/g)||[]).length > 5;
+  });
+  return sentences.slice(0, 40).join(' ');
+}
+
+// ── Extractive summariser ─────────────────────────────────────────────────────
+function extractiveSummarise(bodyText, title, ticker) {
+  if (!bodyText || bodyText.length < 100) return '';
+  const tickerLower = ticker.toLowerCase();
+  const titleWords = title.toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(w => w.length > 3);
+  const FIN_WORDS = ['revenue','earnings','profit','loss','growth','sales','margin','guidance',
+    'forecast','outlook','quarter','annual','results','beat','miss','upgrade','downgrade',
+    'target','price','acquisition','merger','deal','partnership','dividend','buyback',
+    'analyst','rating','shares','stock','market','invest','fund','capital','debt','cash',
+    'percent','million','billion','increase','decrease','raised','cut','announced',
+    'reported','posted','expects','projected','estimates'];
+  const sentences = bodyText.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 40);
+  if (!sentences.length) return '';
+  const scored = sentences.map((s, i) => {
+    const sl = s.toLowerCase();
+    let score = 0;
+    if (i < 3) score += (3 - i) * 4;
+    if (sl.includes(tickerLower)) score += 5;
+    for (const w of titleWords) if (sl.includes(w)) score += 2;
+    for (const w of FIN_WORDS) if (sl.includes(w)) score += 1;
+    const nums = (s.match(/\d+(?:\.\d+)?[%$BMK]?/g) || []).length;
+    score += Math.min(nums, 4);
+    if (/sign up|subscribe|cookie|advertisement|click here|read more/i.test(s)) score -= 20;
+    return { s, score, i };
+  });
+  const top = scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .sort((a, b) => a.i - b.i)
+    .map(x => x.s.trim());
+  const cleaned = top.map(s =>
+    s.replace(/^[^A-Z"(]+/, '').replace(/\s+/g, ' ').trim()
+  ).filter(s => s.length > 30);
+  return cleaned.join(' ');
+}
+
+
 
 // ── Feed builder ──────────────────────────────────────────────────────────────
 function buildFeeds(ticker) {
@@ -393,23 +466,47 @@ async function fetchNews(ticker) {
   const src = relevant.length > 0 ? relevant : [];
   src.sort((a, b) => { try { return new Date(b.pubDate) - new Date(a.pubDate); } catch (e) { return 0; } });
 
-  const articles = src.slice(0, 15).map(item => {
+  // Build base article metadata synchronously
+  const base = src.slice(0, 15).map(item => {
     const lang = detectLang(item.title);
     const { translatedTitle } = translateTitle(item.title, lang);
     const titleForAnalysis = translatedTitle || item.title;
     const sent = sentiment(titleForAnalysis, item.description);
-    const summary = makeSummary(titleForAnalysis, item.description, sent, ticker);
+    const rssSum = makeSummary(titleForAnalysis, item.description, sent, ticker);
     return {
-      title: item.title,                        // always original
-      translatedTitle: translatedTitle || null, // English version if foreign, else null
+      title: item.title,
+      translatedTitle: translatedTitle || null,
       lang,
       source: item.source,
       url: item.link || '',
-      pubDate: isoDate(item.pubDate),    // ISO string for frontend formatting
+      pubDate: isoDate(item.pubDate),
       sentiment: sent,
-      summary,
+      _rssSum: rssSum,
     };
   });
+
+  // Scrape + summarise articles in parallel — free, no API needed
+  // Limit concurrency to 5 at a time to avoid overwhelming the server
+  const articles = [];
+  const CONCURRENCY = 5;
+  for (let i = 0; i < base.length; i += CONCURRENCY) {
+    const batch = base.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(batch.map(async item => {
+      const titleEn = item.translatedTitle || item.title;
+      let summary = item._rssSum;
+      // Only scrape if RSS gave us no useful description
+      if (!summary || summary.length < 80) {
+        const bodyText = await scrapeArticle(item.url);
+        if (bodyText) {
+          const extracted = extractiveSummarise(bodyText, titleEn, ticker);
+          if (extracted && extracted.length > 60) summary = extracted;
+        }
+      }
+      const { _rssSum, ...clean } = item;
+      return { ...clean, summary: summary || '' };
+    }));
+    articles.push(...results);
+  }
 
   console.log('[DONE]', ticker, '—', articles.length, 'articles');
   setCached(ticker, articles);
