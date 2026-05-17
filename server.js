@@ -353,36 +353,23 @@ function sentiment(title, desc) {
 
 // ── Summary generation ────────────────────────────────────────────────────────
 function makeSummary(title, desc, sent, ticker) {
-  // Use description if it's substantive and different from the title
   const rawDesc = (desc || '').trim();
   const cleanDesc = decodeEntities(rawDesc.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim());
-
-  // Strip any residual URLs that leaked into the description
   const noUrls = cleanDesc.replace(/https?:\/\/\S+/g, '').replace(/\s+/g, ' ').trim();
-
-  // Use description if it's long enough and meaningfully different from title
-  const useDesc = noUrls.length > 60 && noUrls.toLowerCase().slice(0, 40) !== title.toLowerCase().slice(0, 40);
-  const base = useDesc ? noUrls : title;
-
-  // Trim to a readable length at a sentence or word boundary
-  let summary = base.length > 220 ? base.slice(0, 217) + '…' : base;
-
-  // Construct a clean sentence: remove trailing source attribution (e.g. "- MarketWatch")
-  summary = summary.replace(/\s*[-–—]\s*(MarketWatch|Reuters|CNBC|Bloomberg|Yahoo Finance|Financial Times|Barron's|Nasdaq|BBC|Seeking Alpha|WSJ|FT|Forbes|Business Insider|The Guardian|AP|Associated Press)\.?\s*$/i, '');
-
-  return summary.trim();
+  // Strip trailing source attribution suffixes
+  const noSource = noUrls.replace(/\s*[-\u2013\u2014|]\s*(MarketWatch|Reuters|CNBC|Bloomberg|Yahoo Finance|Financial Times|Barron's|Nasdaq|BBC|Seeking Alpha|WSJ|FT|Forbes|Business Insider|The Guardian|AP|Associated Press|Fathom Journal|marketscreener\.com|marketscreener)\.?\s*$/i, '').trim();
+  // Skip if description is just a repeat of the title
+  const titleCore = title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 60);
+  const descCore  = noSource.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 60);
+  const isSameAsTitle = descCore === titleCore || noSource.toLowerCase().startsWith(title.toLowerCase().slice(0, 70));
+  // Return full description — no truncation
+  if (noSource.length >= 80 && !isSameAsTitle) return noSource;
+  return '';
 }
 
-function relTime(str) {
+function isoDate(str) {
   if (!str) return '';
-  try {
-    const d = new Date(str); if (isNaN(d)) return str.slice(0, 16);
-    const s = (Date.now() - d) / 1000;
-    if (s < 3600) return Math.max(1, Math.floor(s / 60)) + 'm ago';
-    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-    if (s < 172800) return '1d ago';
-    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-  } catch (e) { return ''; }
+  try { const d = new Date(str); return isNaN(d) ? '' : d.toISOString(); } catch(e) { return ''; }
 }
 
 // ── Main news fetch ───────────────────────────────────────────────────────────
@@ -402,7 +389,8 @@ async function fetchNews(ticker) {
   all = dedup(all);
 
   const relevant = all.filter(item => isRelevant(item, ticker));
-  const src = relevant.length >= 3 ? relevant : all;
+  // Never fall back to unrelated articles — only serve relevant ones
+  const src = relevant.length > 0 ? relevant : [];
   src.sort((a, b) => { try { return new Date(b.pubDate) - new Date(a.pubDate); } catch (e) { return 0; } });
 
   const articles = src.slice(0, 15).map(item => {
@@ -417,7 +405,7 @@ async function fetchNews(ticker) {
       lang,
       source: item.source,
       url: item.link || '',
-      publishedAt: relTime(item.pubDate),
+      pubDate: isoDate(item.pubDate),    // ISO string for frontend formatting
       sentiment: sent,
       summary,
     };
