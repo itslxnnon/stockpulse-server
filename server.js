@@ -28,24 +28,37 @@ async function scrapeArticle(articleUrl) {
 
 function extractBodyText(html) {
   if (!html) return '';
-  // Remove non-content blocks
   let t = html
-    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
-    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-    .replace(/<!(--[\s\S]*?--|\[CDATA\[[\s\S]*?\]\])>/g, ' ')
+    // Remove entire non-content element blocks including their contents
+    .replace(/<(script|style|noscript|iframe|header|footer|nav|aside|form|menu|menuitem|figure|figcaption|picture|svg|canvas|dialog|details|summary)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    // Remove meta, link, input tags
+    .replace(/<(meta|link|input|button|select|option|textarea|label)[^>]*\/?>/gi, ' ')
+    // Strip all remaining tags
     .replace(/<[^>]+>/g, ' ')
+    // Decode entities
+    .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
     .replace(/&[a-z#0-9]+;/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  // Split on sentence-ending punctuation followed by whitespace + capital
-  // Use simple split instead of lookbehind for max compatibility
-  const raw = t.replace(/([.!?])\s+([A-Z"(])/g, '$1☃$2').split('☃');
+
+  // Split into candidate sentences
+  const raw = t.replace(/([.!?])\s+([A-Z"'(])/g, '$1☃$2').split('☃');
+
+  // Patterns that indicate boilerplate/nav/cookie/ui text — discard these sentences
+  const BOILERPLATE = /^(cookie|subscribe|sign in|log in|click here|all rights|privacy|terms of|advertisement|read more|share this|follow us|newsletter|by clicking|you may also|related article|loading|skip to|jump to|back to|home\s|search\s|menu\s|navigation|site map|contact us|about us|careers|investor relations|press release|copyright|sponsored|advertisement|more from|most popular|trending now|also read|see also|watch now|listen now|get the|download the|open the|update your|enable javascript|this website uses|we use cookies|accept cookies|manage cookies|your privacy|data protection|gdpr|please enable|browser not supported|javascript is|for the best experience|version of this page|accessibility|language selector|select language|change language|edition:|us edition|uk edition|international edition|sign up for|get unlimited access|already a subscriber|start your free|try for free|cancel anytime|no commitment|exclusive to|members only|premium content|paywalled|register now|create account|forgot password|reset password|send me|email address|enter your|confirm your|verify your|thank you for|you have successfully|welcome back|good morning|good evening|breaking news:|live updates|live blog|as it happened|follow live|join the conversation|leave a comment|post a comment|comments section|show comments|hide comments|be the first|share your thoughts|have your say|write a review|rate this|was this helpful|report this|flag this|save for later|add to|remove from|shopping cart|checkout|proceed to|place order|free delivery|returns policy|customer service|help centre|faq|sitemap|xml|rss feed|podcast|video|gallery|photos|images|slideshow|infographic|interactive|quiz|survey|poll)/i;
+
   const sentences = raw.map(s => s.trim()).filter(s => {
-    return s.length > 50 && s.length < 700
-      && /^[A-Z"(]/.test(s)
-      && !/^(Cookie|Subscribe|Sign in|Log in|Click here|All rights|Privacy Policy|Terms of|Advertisement|Read more|Share this|Follow us|Newsletter|By clicking|You may also|Related article|Loading)/i.test(s)
-      && (s.split(' ').length) > 7;
+    if (s.length < 40 || s.length > 800) return false;
+    if (!/^[A-Z"'(]/.test(s)) return false;
+    if (s.split(' ').length < 7) return false;
+    if (BOILERPLATE.test(s)) return false;
+    // Discard sentences that are mostly short nav-style words (ratio check)
+    const words = s.split(' ');
+    const shortWords = words.filter(w => w.length <= 3).length;
+    if (shortWords / words.length > 0.6) return false;
+    return true;
   });
+
   return sentences.slice(0, 50).join(' ');
 }
 
@@ -90,7 +103,40 @@ function extractiveSummarise(bodyText, title, ticker) {
 
 
 
-// ── Feed builder ──────────────────────────────────────────────────────────────
+// ── Headline-based fallback summary ──────────────────────────────────────────
+// When scraping fails, derive a meaningful summary from the headline itself
+function headlineSummary(title, ticker, source, sentiment) {
+  // Strip source name from end of title (e.g. "- Yahoo Finance")
+  const clean = title.replace(/\s*[-–—|]\s*(Yahoo Finance|Reuters|CNBC|Bloomberg|MarketWatch|Seeking Alpha|Financial Times|Nasdaq|BBC|Barron's|WSJ|Forbes|AP|Business Insider|The Guardian|Fathom Journal|marketscreener\.com|simplywall\.st|simplywall)\.?\s*$/i, '').trim();
+
+  const sl = clean.toLowerCase();
+  const src = source || 'reports';
+
+  // Pattern-match common headline structures to generate a contextual sentence
+  if (/upgrade|raises? (target|rating|price target)|outperform|buy rating|overweight/i.test(clean))
+    return `${src} has upgraded or raised its price target on ${ticker}, signalling increased analyst confidence in the stock's outlook. This type of analyst action typically reflects improved earnings expectations or a more positive sector view.`;
+  if (/downgrad|cuts? (target|rating|price target)|underperform|sell rating|underweight/i.test(clean))
+    return `${src} has downgraded or cut its price target on ${ticker}, reflecting reduced analyst confidence. Downgrades can pressure the stock as institutional investors may reduce positions in response.`;
+  if (/earnings|results|quarter|revenue|profit|loss|beat|miss|guidance/i.test(clean))
+    return `${ticker} has released financial results or guidance that is attracting analyst attention. ${clean}. Earnings news directly impacts valuation models and near-term price action for the stock.`;
+  if (/acqui|merger|takeover|buyout|deal|partner/i.test(clean))
+    return `${ticker} is involved in M&A or partnership activity. ${clean}. Corporate deals of this nature can significantly re-rate a stock depending on terms, synergies, and strategic fit.`;
+  if (/ipo|listing|nasdaq listing|us listing|public offering/i.test(clean))
+    return `${ticker} is pursuing or has announced a stock market listing or public offering. ${clean}. Listings expand the shareholder base and can trigger significant price discovery and increased trading volume.`;
+  if (/lawsuit|litigation|regulat|fine|penalty|investigation|sec|fraud/i.test(clean))
+    return `${ticker} is facing legal, regulatory, or compliance challenges. ${clean}. Regulatory risk can weigh on valuation and create headline-driven volatility for investors.`;
+  if (/layoff|restructur|job cut|reorg|wind.?down|shut.?down/i.test(clean))
+    return `${ticker} is undergoing operational restructuring or workforce changes. ${clean}. Restructuring can signal both short-term pain and longer-term cost discipline depending on management execution.`;
+  if (/divid|buyback|return.?capital|shareholder/i.test(clean))
+    return `${ticker} has announced a capital return initiative such as a dividend or share buyback. ${clean}. Capital return programmes signal management confidence in cash flow generation and are generally viewed positively by investors.`;
+  if (/surge|rally|jump|soar|high|record/i.test(clean))
+    return `${ticker} shares are experiencing significant upward price movement. ${clean}. Sharp rallies can reflect positive fundamental catalysts or short-covering and may attract momentum-driven investors.`;
+  if (/fall|drop|plunge|decline|crash|low|slump/i.test(clean))
+    return `${ticker} shares are under selling pressure. ${clean}. Declines of this nature may reflect negative fundamentals, sector headwinds, or broader market risk-off sentiment.`;
+
+  // Generic fallback — still informative
+  return `${clean}. This development relates to ${ticker} and may be relevant to investors monitoring the stock's near-term catalysts and risk factors.`;
+}
 function buildFeeds(ticker) {
   const e = s => encodeURIComponent(s);
   const t = ticker;
@@ -500,18 +546,22 @@ async function fetchNews(ticker) {
     const results = await Promise.all(batch.map(async item => {
       const titleEn = item.translatedTitle || item.title;
       let summary = '';
-      // Always attempt to scrape the real article for a proper summary
+      // 1. Try scraping the real article
       const bodyText = await scrapeArticle(item.url);
       if (bodyText) {
         const extracted = extractiveSummarise(bodyText, titleEn, ticker);
         if (extracted && extracted.length > 60) summary = extracted;
       }
-      // Fall back to RSS description only if scrape failed or returned nothing
+      // 2. Fall back to RSS description if scrape yielded nothing
       if (!summary && item._rssSum && item._rssSum.length > 60) {
         summary = item._rssSum;
       }
+      // 3. Always guaranteed: generate from headline if everything else failed
+      if (!summary) {
+        summary = headlineSummary(titleEn, ticker, item.source, item.sentiment);
+      }
       const { _rssSum, ...clean } = item;
-      return { ...clean, summary: summary || '' };
+      return { ...clean, summary };
     }));
     articles.push(...results);
   }
