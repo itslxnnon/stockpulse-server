@@ -744,14 +744,15 @@ async function fetchNews(ticker) {
       const rssIsRepeat = rssRaw.length < 60 || norm(rssRaw).startsWith(norm(titleEn).slice(0, 50));
       const rssContext = rssIsRepeat ? '' : rssRaw;
 
-      // 3. Claude is the primary summarizer — always called for every article
       //    Pass scraped content or RSS as context so Claude has real facts to work with
-      const context = scrapedContext || rssContext;
-      summary = await callClaudeForSummary(titleEn, context, ticker);
+      // 3. Use scraped or RSS content directly if good enough — no API call needed
+      if (scrapedContext) summary = scrapedContext;
+      else if (rssContext) summary = rssContext;
 
-      // 4. Last resort fallback if Claude fails (network issue etc)
-      if (!summary && rssContext) summary = rssContext;
-      if (!summary && scrapedContext) summary = scrapedContext;
+      // 4. Only call Claude if neither scraping nor RSS produced anything useful
+      if (!summary) {
+        summary = await callClaudeForSummary(titleEn, '', ticker);
+      }
 
       // 5. Log per-article result in Render logs
       console.log('[SUMMARY]', item.source, '|', summary ? 'OK '+summary.length+'ch' : 'EMPTY', '|', titleEn.slice(0,50));
