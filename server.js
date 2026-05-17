@@ -106,40 +106,49 @@ function extractBodyText(html) {
 }
 
 // ── Extractive summariser ─────────────────────────────────────────────────────
+// Reads all clean sentences, scores them, picks top 3 by relevance, joins into
+// a coherent paragraph the reader can actually learn from.
 function extractiveSummarise(bodyText, title, ticker) {
   if (!bodyText || bodyText.length < 80) return '';
-  const tickerLower = ticker.toLowerCase();
+  const tLow = ticker.toLowerCase();
   const titleWords = title.toLowerCase().replace(/[^a-z0-9 ]/g,' ').split(' ').filter(w => w.length > 3);
-  const FIN_WORDS = ['revenue','earnings','profit','loss','growth','sales','margin','guidance',
+  const FIN = ['revenue','earnings','profit','loss','growth','sales','margin','guidance',
     'forecast','outlook','quarter','annual','results','beat','miss','upgrade','downgrade',
     'target','price','acquisition','merger','deal','partnership','dividend','buyback',
-    'analyst','rating','shares','stock','market','invest','fund','capital','debt','cash',
-    'percent','million','billion','increase','decrease','raised','cut','announced',
-    'reported','posted','expects','projected','estimates'];
-  // Split without lookbehind
-  const sentences = bodyText.replace(/([.!?])\s+([A-Z"(])/g,'$1☃$2').split('☃')
-    .map(s => s.trim()).filter(s => s.length > 40);
+    'analyst','rating','shares','stock','market','invest','capital','debt','cash',
+    'percent','%','million','billion','increase','decrease','raised','cut','announced',
+    'reported','expects','projected','estimates','listing','nasdaq','valuation','surge','decline'];
+  // Split on sentence boundaries
+  const sentences = bodyText.replace(/([.!?])\s+([A-Z"'(])/g,'$1\u2603$2').split('\u2603')
+    .map(s => s.trim()).filter(s => s.length >= 40 && s.length <= 800);
   if (!sentences.length) return '';
   const scored = sentences.map((s, i) => {
     const sl = s.toLowerCase();
     let score = 0;
-    if (i === 0) score += 10;
-    else if (i === 1) score += 6;
-    else if (i === 2) score += 3;
-    if (sl.includes(tickerLower)) score += 6;
-    for (const w of titleWords) if (sl.includes(w)) score += 2;
-    for (const w of FIN_WORDS) if (sl.includes(w)) score += 1;
-    const nums = (s.match(/\d/g) || []).length;
-    score += Math.min(nums, 5);
-    if (/sign up|subscribe|cookie|advertisement|click here|read more|follow us/i.test(s)) score -= 30;
+    // Position: lead sentences are most important in journalism
+    if (i === 0) score += 12;
+    else if (i === 1) score += 7;
+    else if (i === 2) score += 4;
+    else if (i === 3) score += 2;
+    // Ticker mention
+    if (sl.includes(tLow)) score += 8;
+    // Title word overlap — sentence talks about the same topic as the headline
+    for (const w of titleWords) if (sl.includes(w)) score += 3;
+    // Financial keyword density — concrete facts score higher
+    for (const w of FIN) if (sl.includes(w)) score += 2;
+    // Numbers and percentages — concrete data points are valuable
+    score += Math.min((s.match(/\d[\d,.]*[%$]?/g)||[]).length * 2, 8);
+    // Penalise boilerplate
+    if (/sign.?up|subscri|cookie|click here|read more|follow us|advertisement/i.test(s)) score -= 50;
     return { s, score, i };
   });
+  // Take top 4 by score, restore original order, join as paragraph
   const top = scored
-    .filter(x => x.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 3)
-    .sort((a, b) => a.i - b.i)
-    .map(x => x.s.replace(/^[^A-Z"(]+/, '').replace(/\s+/g,' ').trim())
+    .filter(x => x.score > 2)
+    .sort((a,b) => b.score - a.score)
+    .slice(0, 4)
+    .sort((a,b) => a.i - b.i)
+    .map(x => x.s.replace(/^[^A-Z"'(]+/,'').replace(/\s+/g,' ').trim())
     .filter(s => s.length > 30);
   return top.join(' ');
 }
@@ -183,32 +192,28 @@ function headlineSummary(title, ticker, source, sentiment) {
 function buildFeeds(ticker) {
   const e = s => encodeURIComponent(s);
   const t = ticker;
+  const w = 'when:14d '; // limit Google News results to last 14 days
   return [
-    `https://news.google.com/rss/search?q=${e(t+' stock news')}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e('"'+t+'" stock')}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e(t+' shares earnings')}&hl=en-GB&gl=GB&ceid=GB:en`,
+    `https://news.google.com/rss/search?q=${e(w+t+' stock news')}&hl=en-US&gl=US&ceid=US:en`,
+    `https://news.google.com/rss/search?q=${e(w+'"'+t+'" stock')}&hl=en-US&gl=US&ceid=US:en`,
+    `https://news.google.com/rss/search?q=${e(w+t+' shares earnings')}&hl=en-GB&gl=GB&ceid=GB:en`,
     `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${e(t)}&region=US&lang=en-US`,
     `https://www.nasdaq.com/feed/rssoutbound?symbol=${e(t)}`,
-    `https://news.google.com/rss/search?q=${e('site:reuters.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e('site:cnbc.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e('site:ft.com '+t)}&hl=en-GB&gl=GB&ceid=GB:en`,
-    `https://news.google.com/rss/search?q=${e('site:marketwatch.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e('site:seekingalpha.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e('site:bloomberg.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e('site:barrons.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e('site:wsj.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
-    `https://news.google.com/rss/search?q=${e(t+' Aktie')}&hl=de-DE&gl=DE&ceid=DE:de`,
-    `https://news.google.com/rss/search?q=${e('site:handelsblatt.com '+t)}&hl=de-DE&gl=DE&ceid=DE:de`,
-    `https://news.google.com/rss/search?q=${e(t+' action bourse')}&hl=fr-FR&gl=FR&ceid=FR:fr`,
-    `https://news.google.com/rss/search?q=${e('site:lesechos.fr '+t)}&hl=fr-FR&gl=FR&ceid=FR:fr`,
-    `https://news.google.com/rss/search?q=${e(t+' azioni borsa')}&hl=it-IT&gl=IT&ceid=IT:it`,
-    `https://news.google.com/rss/search?q=${e(t+' 株価')}&hl=ja-JP&gl=JP&ceid=JP:ja`,
-    `https://news.google.com/rss/search?q=${e('site:nikkei.com '+t)}&hl=ja-JP&gl=JP&ceid=JP:ja`,
-    `https://news.google.com/rss/search?q=${e(t+' 股票')}&hl=zh-HK&gl=HK&ceid=HK:zh-Hant`,
-    `https://news.google.com/rss/search?q=${e('site:scmp.com '+t)}&hl=en-HK&gl=HK&ceid=HK:en`,
-    `https://feeds.bbci.co.uk/news/business/rss.xml`,
-    `https://www.cnbc.com/id/100003114/device/rss/rss.html`,
-    `https://feeds.marketwatch.com/marketwatch/topstories/`,
+    `https://news.google.com/rss/search?q=${e(w+'site:reuters.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
+    `https://news.google.com/rss/search?q=${e(w+'site:cnbc.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
+    `https://news.google.com/rss/search?q=${e(w+'site:ft.com '+t)}&hl=en-GB&gl=GB&ceid=GB:en`,
+    `https://news.google.com/rss/search?q=${e(w+'site:marketwatch.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
+    `https://news.google.com/rss/search?q=${e(w+'site:seekingalpha.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
+    `https://news.google.com/rss/search?q=${e(w+'site:bloomberg.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
+    `https://news.google.com/rss/search?q=${e(w+'site:barrons.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
+    `https://news.google.com/rss/search?q=${e(w+'site:wsj.com '+t)}&hl=en-US&gl=US&ceid=US:en`,
+    `https://news.google.com/rss/search?q=${e(w+t+' Aktie')}&hl=de-DE&gl=DE&ceid=DE:de`,
+    `https://news.google.com/rss/search?q=${e(w+t+' action bourse')}&hl=fr-FR&gl=FR&ceid=FR:fr`,
+    `https://news.google.com/rss/search?q=${e(w+t+' azioni borsa')}&hl=it-IT&gl=IT&ceid=IT:it`,
+    `https://news.google.com/rss/search?q=${e(w+t+' 株価')}&hl=ja-JP&gl=JP&ceid=JP:ja`,
+    `https://news.google.com/rss/search?q=${e(w+t+' 股票')}&hl=zh-HK&gl=HK&ceid=HK:zh-Hant`,
+    `https://news.google.com/rss/search?q=${e(w+'$'+t+' stock')}&hl=en-US&gl=US&ceid=US:en`,
+    `https://news.google.com/rss/search?q=${e(w+t+' investor news')}&hl=en-US&gl=US&ceid=US:en`,
   ];
 }
 
@@ -306,27 +311,37 @@ function dedup(items) {
 function isRelevant(item, ticker) {
   const tLow = ticker.toLowerCase();
   const title = (item.title || '').toLowerCase();
-  // Require the ticker to appear as a standalone word or exchange prefix in the title
-  // This prevents "SIVE" matching inside "exclusive", "massive", "pervasive" etc.
-  // Simple approach: split title into words and check for exact match
-  const titleWords = title.replace(/[^a-z0-9:\s]/g, ' ').split(/\s+/);
-  const directMatch = titleWords.some(w => w === tLow || w === tLow + ':' || w.endsWith(':' + tLow));
+  // Strip punctuation and split into words — but also keep $ticker format
+  const titleWords = title.replace(/[^a-z0-9:$\s]/g, ' ').split(/\s+/);
+  // Match: exact word, $TICKER format, or exchange:ticker (OM:SIVE, OTCMKTS:SIVEF)
+  const directMatch = titleWords.some(w =>
+    w === tLow ||
+    w === '$' + tLow ||
+    w === tLow + ':' ||
+    w.endsWith(':' + tLow)
+  );
   if (directMatch) return true;
-  // Also allow exchange:ticker format like om:sive, nasdaq:aapl
+  // exchange:ticker substring (handles om:sive inside a longer string)
   if (title.includes(':' + tLow)) return true;
+  // $ticker substring
+  if (title.includes('$' + tLow)) return true;
   return false;
 }
 
 // ── Language detection ────────────────────────────────────────────────────────
 function detectLang(text) {
-  if (/[\u3040-\u30ff]/.test(text)) return 'ja';
-  if (/[\u4e00-\u9fff]/.test(text)) return /[\u3040-\u30ff]/.test(text) ? 'ja' : 'zh';
-  if (/[ÄäÖöÜüß]/.test(text) || /\b(Aktie|Kurs|Gewinn|Verlust|Anleger|Börse|Dividende|Quartalsbericht|Umsatz|Prognose|Bilanz|Fusion|Übernahme|Marktkapitalisierung|Gewinnwarnung)\b/i.test(text)) return 'de';
-  if (/[àâçéèêëîïôùûüÿœæ]/.test(text) && /\b(bourse|actions?|hausse|baisse|bénéfice|résultats?|croissance|marché|investisseurs?|dividende|prévisions?|perte|chiffre)\b/i.test(text)) return 'fr';
-  if (/\b(azioni|borsa|guadagni?|perdite?|ricavi|trimestre|fatturato|utile|titolo|mercato|quotazione|rialzo|ribasso)\b/i.test(text)) return 'it';
-  if (/[áéíóúñ]/.test(text) && /\b(bolsa|acciones?|ganancias?|pérdidas?|beneficio|ingresos?|mercado|trimestre|inversores?|dividendo|resultados?)\b/i.test(text)) return 'es';
-  if (/\b(aandelen|koers|winst|verlies|beurs|dividend|kwartaal|omzet|fusie|overname)\b/i.test(text)) return 'nl';
-  if (/[ążźćśęłóń]/i.test(text) && /\b(akcje|kurs|zysk|strata|giełda|dywidenda|przychody|wyniki)\b/i.test(text)) return 'pl';
+  // Strip ticker symbols ($SIVE, $AMZN etc) before language detection so they
+  // don't confuse the character-range checks
+  const t = text.replace(/\$[A-Z]{1,6}/g, '').trim();
+  if (/[\u3040-\u30ff]/.test(t)) return 'ja';
+  // Chinese: CJK block, must have enough CJK chars to not be a false positive
+  if (/[\u4e00-\u9fff]/.test(t) && (t.match(/[\u4e00-\u9fff]/g)||[]).length > 3) return 'zh';
+  if (/[ÄäÖöÜüß]/.test(t) || /\b(Aktie|Kurs|Gewinn|Verlust|Anleger|Börse|Dividende|Quartalsbericht|Umsatz|Prognose|Bilanz|Fusion|Übernahme|Marktkapitalisierung|Gewinnwarnung)\b/i.test(t)) return 'de';
+  if (/[àâçéèêëîïôùûüÿœæ]/.test(t) && /\b(bourse|actions?|hausse|baisse|bénéfice|résultats?|croissance|marché|investisseurs?|dividende|prévisions?|perte|chiffre)\b/i.test(t)) return 'fr';
+  if (/\b(azioni|borsa|guadagni?|perdite?|ricavi|trimestre|fatturato|utile|titolo|mercato|quotazione|rialzo|ribasso)\b/i.test(t)) return 'it';
+  if (/[áéíóúñ]/.test(t) && /\b(bolsa|acciones?|ganancias?|pérdidas?|beneficio|ingresos?|mercado|trimestre|inversores?|dividendo|resultados?)\b/i.test(t)) return 'es';
+  if (/\b(aandelen|koers|winst|verlies|beurs|dividend|kwartaal|omzet|fusie|overname)\b/i.test(t)) return 'nl';
+  if (/[ążźćśęłóń]/i.test(t) && /\b(akcje|kurs|zysk|strata|giełda|dywidenda|przychody|wyniki)\b/i.test(t)) return 'pl';
   return 'en';
 }
 
@@ -511,7 +526,13 @@ function translateTitle(title, lang) {
   else if (lang === 'pl') translated = applyPhraseMap(translated, PL_PHRASES);
   else if (lang === 'ja') translated = applyPhraseMap(translated, JA_MAP);
   else if (lang === 'zh') translated = applyPhraseMap(translated, ZH_MAP);
+  // If nothing changed at all, no translation available
   if (translated.trim() === title.trim()) return { translatedTitle: null };
+  // For CJK languages, even a partial translation is useful — return it
+  // For European languages, require at least 30% of content to have changed
+  if (lang === 'ja' || lang === 'zh') return { translatedTitle: translated.trim() };
+  const changeRatio = 1 - (translated.length / title.length);
+  if (Math.abs(changeRatio) < 0.05 && translated.trim() === title.trim()) return { translatedTitle: null };
   return { translatedTitle: translated.trim() };
 }
 
@@ -569,9 +590,18 @@ async function fetchNews(ticker) {
   // Never fall back to unrelated articles — only serve relevant ones
   const src = relevant.length > 0 ? relevant : [];
   src.sort((a, b) => { try { return new Date(b.pubDate) - new Date(a.pubDate); } catch (e) { return 0; } });
+  // Filter to last 14 days — reject anything older
+  const cutoff = Date.now() - 14 * 24 * 60 * 60 * 1000;
+  const recent = src.filter(item => {
+    try { return new Date(item.pubDate).getTime() >= cutoff; } catch(e) { return false; }
+  });
+  // Use recent if we have any, otherwise fall back to src (so we always show something)
+  const final = recent.length > 0 ? recent : src;
+  const top15 = final.slice(0, 15);
+  console.log('[RECENCY]', ticker, '—', src.length, 'relevant,', recent.length, 'within 14d, using', top15.length);
 
   // Build base article metadata synchronously
-  const base = src.slice(0, 15).map(item => {
+  const base = top15.map(item => {
     const lang = detectLang(item.title);
     const { translatedTitle } = translateTitle(item.title, lang);
     const titleForAnalysis = translatedTitle || item.title;
