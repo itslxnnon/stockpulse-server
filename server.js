@@ -15,60 +15,44 @@ function setCached(k,d){ cache.set(k,{data:d,ts:Date.now()}); }
 // ── Article scraper ───────────────────────────────────────────────────────────
 async function scrapeArticle(articleUrl) {
   if (!articleUrl || !articleUrl.startsWith('http')) return '';
-  const BLOCKED = ['wsj.com','ft.com','barrons.com','bloomberg.com','seekingalpha.com','economist.com','hbr.org','theatlantic.com','newyorker.com'];
-  
-  // If it's a Google News redirect URL, resolve it to the real article URL first
-  let realUrl = articleUrl;
-  if (articleUrl.includes('news.google.com')) {
-    try {
-      realUrl = await resolveGoogleNewsUrl(articleUrl);
-    } catch(e) { return ''; }
-  }
-  
-  try { const host = new URL(realUrl).hostname; if (BLOCKED.some(b => host.includes(b))) return ''; } catch(e) { return ''; }
-  try { return extractBodyText(await fetchArticleHTML(realUrl, 12000)); } catch(e) { return ''; }
-}
-
-// Follows Google News redirect to get the actual article URL
-function resolveGoogleNewsUrl(googleUrl) {
-  return new Promise((resolve, reject) => {
-    let redirects = 0;
-    function go(u) {
-      try {
-        const p = new URL(u);
-        const req = require('https').request({
-          hostname: p.hostname, port: 443,
-          path: p.pathname + (p.search||''),
-          method: 'GET',
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-            'Accept': 'text/html,*/*',
-          },
-          timeout: 8000,
-        }, res => {
-          if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location) {
-            let next = res.headers.location;
-            if (!next.startsWith('http')) next = 'https://' + p.hostname + next;
-            // If we've reached a non-google URL, that's our real article
-            if (!next.includes('google.com') || redirects > 3) { res.resume(); resolve(next); return; }
-            redirects++;
-            res.resume(); go(next); return;
-          }
-          // No redirect — the current URL IS the article (or we're on the article page)
-          res.resume(); resolve(u);
-        });
-        req.on('error', reject);
-        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-        req.end();
-      } catch(e) { reject(e); }
+  const BLOCKED = ['wsj.com','ft.com','barrons.com','bloomberg.com','seekingalpha.com','economist.com','hbr.org','theatlantic.com'];
+  try {
+    // Decode Google News encoded article URLs
+    let realUrl = articleUrl;
+    if (articleUrl.includes('news.google.com/rss/articles/') || articleUrl.includes('news.google.com/articles/')) {
+      realUrl = decodeGoogleNewsUrl(articleUrl) || articleUrl;
     }
-    go(googleUrl);
-  });
+    const host = new URL(realUrl).hostname;
+    if (BLOCKED.some(b => host.includes(b))) return '';
+    const html = await fetchArticleHTML(realUrl, 12000);
+    return extractBodyText(html);
+  } catch(e) {
+    console.log('[SCRAPE ERR]', articleUrl.slice(0,80), e.message);
+    return '';
+  }
 }
 
-// Browser-like article fetcher — streams only first 80KB, follows redirects
+// Google News RSS URLs encode the real article URL in base64 inside the path.
+// Format: https://news.google.com/rss/articles/CBMi<base64payload>
+// The payload is a binary blob; the real URL appears as a UTF-8 string within it.
+function decodeGoogleNewsUrl(googleUrl) {
+  try {
+    const path = new URL(googleUrl).pathname;
+    // Extract base64 segment after /articles/ or /rss/articles/
+    const b64 = path.replace(/^\/(?:rss\/)?articles\//, '').split('?')[0];
+    if (!b64) return null;
+    // Base64url decode (replace - with + and _ with /)
+    const decoded = Buffer.from(b64.replace(/-/g,'+').replace(/_/g,'/'), 'base64').toString('binary');
+    // The real URL is embedded in the binary payload — find it by looking for http
+    const match = decoded.match(/https?:\/\/[^\x00-\x1f\x7f-\xff\s"'<>]+/);
+    if (match && match[0] && !match[0].includes('google.com')) return match[0];
+    return null;
+  } catch(e) { return null; }
+}
+
+// Fetches article HTML — browser headers, follows redirects, streams first 100KB
 function fetchArticleHTML(targetUrl, ms) {
-  ms = ms || 10000;
+  ms = ms || 12000;
   return new Promise((resolve, reject) => {
     let redirects = 0;
     function go(u) {
@@ -85,11 +69,10 @@ function fetchArticleHTML(targetUrl, ms) {
           'Accept-Language': 'en-US,en;q=0.9',
           'Accept-Encoding': 'identity',
           'Cache-Control': 'no-cache',
-          'Connection': 'close',
         },
         timeout: ms,
       }, res => {
-        if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location && redirects++ < 4) {
+        if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location && redirects++ < 6) {
           let next = res.headers.location;
           if (!next.startsWith('http')) next = parsed.protocol + '//' + parsed.hostname + next;
           res.resume(); go(next); return;
@@ -98,7 +81,7 @@ function fetchArticleHTML(targetUrl, ms) {
         const chunks = []; let total = 0;
         res.on('data', chunk => {
           chunks.push(chunk); total += chunk.length;
-          if (total > 80000) { req.destroy(); resolve(Buffer.concat(chunks).toString('utf-8')); }
+          if (total > 100000) { req.destroy(); resolve(Buffer.concat(chunks).toString('utf-8')); }
         });
         res.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
         res.on('error', reject);
@@ -112,43 +95,42 @@ function fetchArticleHTML(targetUrl, ms) {
 }
 
 function extractBodyText(html) {
-  if (!html) return '';
+  if (!html || html.length < 200) return '';
 
-  // Step 1: Try to isolate the main article content zone
-  let zone = '';
-  const articleM = html.match(/<article[^>]*>([\s\S]{300,}?)<\/article>/i);
-  const mainM    = html.match(/<main[^>]*>([\s\S]{300,}?)<\/main>/i);
-  if (articleM)   zone = articleM[1];
+  // Step 1: Prefer article or main zone if present
+  let zone = html;
+  const artM  = html.match(/<article[^>]*>([\s\S]{200,}?)<\/article>/i);
+  const mainM = html.match(/<main[^>]*>([\s\S]{200,}?)<\/main>/i);
+  if (artM)       zone = artM[1];
   else if (mainM) zone = mainM[1];
-  else            zone = html;
 
-  // Step 2: Strip non-prose elements
+  // Step 2: Strip non-content tags
   let t = zone
     .replace(/<(script|style|noscript|iframe|header|footer|nav|aside|form|menu|figure|figcaption|picture|svg|canvas|dialog)[^>]*>[\s\S]*?<\/\1>/gi, ' ')
     .replace(/<(meta|link|input|button|select|option|textarea|label|img|br|hr)[^>]*\/?>/gi, ' ')
     .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<\/?(?:p|div|section|span|h[1-6]|li|td|th|blockquote)[^>]*>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')
     .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
     .replace(/&[a-z#0-9]+;/gi, ' ')
-    .replace(/\s+/g, ' ').trim();
+    .replace(/[ \t]+/g, ' ').trim();
 
-  // Step 3: Split sentences and filter boilerplate
-  const raw = t.replace(/([.!?])\s+([A-Z"'(])/g, '$1\u2603$2').split('\u2603');
+  // Step 3: Split into sentences
+  const raw = t.replace(/([.!?])[ \t]+([A-Z"'])/g, '$1\u2603$2').split('\u2603');
 
-  const JUNK = /^(cookie|accept all|we use|privacy|terms|subscribe|sign in|log in|register|get access|advertisement|sponsored|follow us|share this|most popular|trending|related:|you may|see also|read next|read more|more from|load more|show more|click here|tap here|skip|jump to|back to top|home page|search results|no results|data unavailable|could not find|javascript|please enable|accessibility|edition:|breaking news|live blog|newsletter|download app|copyright|all rights reserved|powered by|built with|opt out|gdpr|ccpa)/i;
+  const JUNK = /^(cookie|we use cookies|accept|privacy policy|terms of|subscribe|sign in|log in|create account|advertisement|sponsored|follow us|share this|trending|see also|read more|more from|load more|click here|skip to|back to top|no results|data not available|javascript required|please enable|powered by|all rights reserved|copyright \d)/i;
 
-  const sentences = raw.map(s => s.trim()).filter(s => {
-    if (s.length < 50 || s.length > 900) return false;
-    if (!/^[A-Z"'(]/.test(s)) return false;
-    if (s.split(/\s+/).length < 8) return false;
+  const sentences = raw.map(s => s.replace(/\n/g,' ').replace(/\s+/g,' ').trim()).filter(s => {
+    if (s.length < 30 || s.length > 1000) return false;
     if (JUNK.test(s)) return false;
     const words = s.split(/\s+/);
-    if (words.filter(w => w.length <= 3).length / words.length > 0.55) return false;
-    if (words.filter(w => w.length > 1 && w === w.toUpperCase() && /^[A-Z]+$/.test(w)).length / words.length > 0.35) return false;
+    if (words.length < 5) return false;
+    const capsRatio = words.filter(w => w.length > 1 && /^[A-Z]{2,}$/.test(w)).length / words.length;
+    if (capsRatio > 0.4) return false;
     return true;
   });
 
-  return sentences.slice(0, 50).join(' ');
+  return sentences.slice(0, 60).join(' ');
 }
 
 // ── Extractive summariser ─────────────────────────────────────────────────────
@@ -626,20 +608,17 @@ function sentiment(title, desc) {
   return b > r ? 'bullish' : r > b ? 'bearish' : 'neutral';
 }
 
-// ── Summary generation ────────────────────────────────────────────────────────
+// ── Summary generation from RSS description ──────────────────────────────────
 function makeSummary(title, desc, sent, ticker) {
-  const rawDesc = (desc || '').trim();
-  const cleanDesc = decodeEntities(rawDesc.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim());
-  const noUrls = cleanDesc.replace(/https?:\/\/\S+/g, '').replace(/\s+/g, ' ').trim();
-  // Strip trailing source attribution suffixes
-  const noSource = noUrls.replace(/\s*[-\u2013\u2014|]\s*(MarketWatch|Reuters|CNBC|Bloomberg|Yahoo Finance|Financial Times|Barron's|Nasdaq|BBC|Seeking Alpha|WSJ|FT|Forbes|Business Insider|The Guardian|AP|Associated Press|Fathom Journal|marketscreener\.com|marketscreener)\.?\s*$/i, '').trim();
-  // Skip if description is just a repeat of the title
-  const titleCore = title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 60);
-  const descCore  = noSource.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 60);
-  const isSameAsTitle = descCore === titleCore || noSource.toLowerCase().startsWith(title.toLowerCase().slice(0, 70));
-  // Return full description — no truncation
-  if (noSource.length >= 80 && !isSameAsTitle) return noSource;
-  return '';
+  if (!desc || desc.trim().length < 40) return '';
+  const clean = decodeEntities(desc.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim());
+  const noUrls = clean.replace(/https?:\/\/\S+/g,'').replace(/\s+/g,' ').trim();
+  const noSource = noUrls.replace(/\s*[-–—|]\s*(Yahoo Finance|Reuters|CNBC|Bloomberg|MarketWatch|Financial Times|Barron's|Nasdaq|BBC|Seeking Alpha|WSJ|Forbes|AP|Business Insider|Fathom Journal|marketscreener\.com|simplywall\.st|TechStock|TradingView)\.?\s*$/i,'').trim();
+  if (noSource.length < 40) return '';
+  // Only discard if desc is character-for-character identical to title
+  const norm = s => s.toLowerCase().replace(/[^a-z0-9]/g,'');
+  if (norm(noSource) === norm(title)) return '';
+  return noSource;
 }
 
 function isoDate(str) {
